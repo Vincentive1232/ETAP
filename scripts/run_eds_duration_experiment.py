@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+import math
 import sys
 from pathlib import Path
 
@@ -24,13 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from run_ec_duration_experiment import (
-    build_frame_results,
     evaluate_prediction,
     load_model,
     load_tracks,
-    plot_pixel_speed_results,
-    run_trial,
-    write_frame_results,
+    run_trial_arrays,
 )
 
 
@@ -43,8 +42,10 @@ DEFAULT_SEQUENCES = (
 
 RESULT_FIELDS = (
     "sequence",
+    "difficulty",
     "duration_ms",
     "timestamp_origin_s",
+    "clip_mean_pixel_speed_pxps",
     "accuracy_1px",
     "accuracy_3px",
     "accuracy_5px",
@@ -60,6 +61,11 @@ RESULT_FIELDS = (
     "events_file",
     "prediction_path",
 )
+FRAME_FIELDS = (
+    "sequence", "clip_difficulty", "duration_ms", "timestamp",
+    "time_since_clip_start_s", "pixel_speed_pxps", "accuracy_5px",
+    "mean_endpoint_error_px", "num_valid_tracks", "pixel_speed_class",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +73,12 @@ def parse_args() -> argparse.Namespace:
         description="Run the fixed-duration tracking experiment on EDS."
     )
     parser.add_argument("--data-root", type=Path, default=Path("data/eds"))
+    parser.add_argument(
+        "--clips-root",
+        type=Path,
+        default=None,
+        help="Optional slow/medium/fast clips from slice_eds_by_difficulty.py.",
+    )
     parser.add_argument(
         "--gt-tracks-root", type=Path, default=Path("config/misc/eds/gt_tracks")
     )
@@ -208,7 +220,7 @@ def write_results(path: Path, rows: list[dict[str, object]]) -> None:
 def read_results(path: Path) -> list[dict[str, object]]:
     with path.open(newline="") as handle:
         rows = list(csv.DictReader(handle))
-    non_numeric = {"sequence", "events_file", "prediction_path"}
+    non_numeric = {"sequence", "difficulty", "events_file", "prediction_path"}
     for row in rows:
         for field in set(row) - non_numeric:
             row[field] = float(row[field])
@@ -225,6 +237,134 @@ def read_frame_results(path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def build_frame_results(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    output: list[dict[str, object]] = []
+    for row in rows:
+        with np.load(str(row["prediction_path"])) as data:
+            pred, gt = data["coords"], data["gt_tracks"]
+            timestamps = data["timestamps"]
+        for index in range(1, len(timestamps)):
+            valid_motion = np.all(np.isfinite(gt[index - 1]), axis=1) & np.all(np.isfinite(gt[index]), axis=1)
+            valid_error = np.all(np.isfinite(gt[index]), axis=1) & np.all(np.isfinite(pred[index]), axis=1)
+            dt = float(timestamps[index] - timestamps[index - 1])
+            if dt <= 0 or not np.any(valid_motion) or not np.any(valid_error):
+                continue
+            speed = np.linalg.norm(gt[index, valid_motion] - gt[index - 1, valid_motion], axis=1) / dt
+            errors = np.linalg.norm(pred[index, valid_error] - gt[index, valid_error], axis=1)
+            output.append(
+                {
+                    "sequence": row["sequence"],
+                    "clip_difficulty": row["difficulty"],
+                    "duration_ms": float(row["duration_ms"]),
+                    "timestamp": float(timestamps[index]),
+                    "time_since_clip_start_s": float(timestamps[index] - timestamps[0]),
+                    "pixel_speed_pxps": float(np.median(speed)),
+                    "accuracy_5px": float(np.mean(errors <= 5)),
+                    "mean_endpoint_error_px": float(np.mean(errors)),
+                    "num_valid_tracks": int(len(errors)),
+                    "pixel_speed_class": "",
+                }
+            )
+    speeds = np.asarray([float(row["pixel_speed_pxps"]) for row in output])
+    low, high = np.quantile(speeds, [1 / 3, 2 / 3])
+    for row in output:
+        speed = float(row["pixel_speed_pxps"])
+        row["pixel_speed_class"] = "slow" if speed <= low else "medium" if speed <= high else "fast"
+    return output
+
+
+def write_frame_results(path: Path, rows: list[dict[str, object]]) -> None:
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=FRAME_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_pixel_speed_results(rows: list[dict[str, object]], output_dir: Path) -> None:
+    durations = sorted({float(row["duration_ms"]) for row in rows})
+    colors = {"slow": "tab:blue", "medium": "tab:orange", "fast": "tab:red"}
+
+    def weighted(selected: list[dict[str, object]]) -> float:
+        return float(
+            np.average(
+                [float(row["accuracy_5px"]) for row in selected],
+                weights=[float(row["num_valid_tracks"]) for row in selected],
+            )
+        )
+
+    fig, axis = plt.subplots(figsize=(8, 5))
+    for speed_class in ("slow", "medium", "fast"):
+        means = []
+        for duration in durations:
+            selected = [
+                row for row in rows
+                if row["pixel_speed_class"] == speed_class
+                and float(row["duration_ms"]) == duration
+            ]
+            means.append(weighted(selected))
+        axis.plot(durations, means, marker="o", ms=3, color=colors[speed_class], label=speed_class)
+    axis.set_xlabel("Event-window duration [ms]")
+    axis.set_ylabel("Per-frame tracking accuracy @ 5 px")
+    axis.grid(alpha=0.25)
+    axis.legend(title="GT pixel speed")
+    fig.tight_layout()
+    fig.savefig(output_dir / "accuracy_vs_duration_by_pixel_speed.png", dpi=180)
+    plt.close(fig)
+
+    speeds = np.asarray([float(row["pixel_speed_pxps"]) for row in rows])
+    edges = np.unique(np.quantile(speeds, np.linspace(0, 1, 9)))
+    if len(edges) < 2:
+        edges = np.array([speeds[0] - 0.5, speeds[0] + 0.5])
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    matrix = np.full((len(centers), len(durations)), np.nan)
+    for i, (left, right) in enumerate(zip(edges[:-1], edges[1:])):
+        for j, duration in enumerate(durations):
+            selected = [
+                row for row in rows
+                if left <= float(row["pixel_speed_pxps"]) <= right
+                and float(row["duration_ms"]) == duration
+            ]
+            if selected:
+                matrix[i, j] = weighted(selected)
+    fig, axis = plt.subplots(figsize=(9, 6))
+    image = axis.imshow(matrix, origin="lower", aspect="auto", vmin=0, vmax=1, cmap="magma")
+    axis.set_xticks(range(len(durations)), [f"{duration:g}" for duration in durations], rotation=45)
+    axis.set_yticks(range(len(centers)), [f"{center:.0f}" for center in centers])
+    axis.set_xlabel("Event-window duration [ms]")
+    axis.set_ylabel("Median GT pixel speed bin [px/s]")
+    fig.colorbar(image, ax=axis, label="Accuracy @ 5 px")
+    fig.tight_layout()
+    fig.savefig(output_dir / "accuracy_duration_pixel_speed_heatmap.png", dpi=180)
+    plt.close(fig)
+
+    best_durations = np.asarray(durations)[np.nanargmax(matrix, axis=1)]
+    can_correlate = len(centers) > 1 and np.std(best_durations) > 0
+    correlation = float(np.corrcoef(centers, best_durations)[0, 1]) if can_correlate else math.nan
+    slope, intercept = np.polyfit(centers, best_durations, 1) if len(centers) > 1 else (math.nan, best_durations[0])
+    fig, axis = plt.subplots(figsize=(8, 5))
+    axis.scatter(centers, best_durations, color="tab:purple")
+    if len(centers) > 1:
+        line_x = np.linspace(centers.min(), centers.max(), 100)
+        axis.plot(line_x, intercept + slope * line_x, "k--", label=f"slope={slope:.3f}")
+    axis.set_xlabel("Median GT pixel speed [px/s]")
+    axis.set_ylabel("Best duration [ms]")
+    axis.grid(alpha=0.25)
+    axis.legend()
+    fig.tight_layout()
+    fig.savefig(output_dir / "optimal_duration_vs_pixel_speed.png", dpi=180)
+    plt.close(fig)
+    with (output_dir / "pixel_speed_relationship.json").open("w") as handle:
+        json.dump(
+            {
+                "optimal_duration_pixel_speed_pearson_r": correlation,
+                "optimal_duration_slope_ms_per_pxps": float(slope),
+                "speed_tertile_boundaries_pxps": [float(np.quantile(speeds, 1 / 3)), float(np.quantile(speeds, 2 / 3))],
+            },
+            handle,
+            indent=2,
+        )
+
+
 def plot_sequence_results(rows: list[dict[str, object]], output_dir: Path) -> None:
     sequences = sorted({str(row["sequence"]) for row in rows})
     fig, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
@@ -233,9 +373,12 @@ def plot_sequence_results(rows: list[dict[str, object]], output_dir: Path) -> No
             (row for row in rows if row["sequence"] == sequence),
             key=lambda row: float(row["duration_ms"]),
         )
-        durations = [float(row["duration_ms"]) for row in subset]
-        axes[0].plot(durations, [float(row["accuracy_5px"]) for row in subset], marker="o", ms=3, label=sequence)
-        axes[1].plot(durations, [float(row["mean_endpoint_error_px"]) for row in subset], marker="o", ms=3, label=sequence)
+        for difficulty in sorted({str(row["difficulty"]) for row in subset}):
+            group = [row for row in subset if row["difficulty"] == difficulty]
+            durations = [float(row["duration_ms"]) for row in group]
+            label = sequence if difficulty == "full_gt" else f"{sequence}/{difficulty}"
+            axes[0].plot(durations, [float(row["accuracy_5px"]) for row in group], marker="o", ms=3, label=label)
+            axes[1].plot(durations, [float(row["mean_endpoint_error_px"]) for row in group], marker="o", ms=3, label=label)
     axes[0].set_ylabel("Tracking accuracy @ 5 px")
     axes[1].set_ylabel("Mean endpoint error [px]")
     axes[1].set_xlabel("Event-window duration [ms]")
@@ -253,7 +396,7 @@ def create_frame_analysis(
     compatible = [
         {
             "sequence": row["sequence"],
-            "difficulty": "full_gt",
+            "difficulty": row["difficulty"],
             "duration_ms": row["duration_ms"],
             "prediction_path": row["prediction_path"],
         }
@@ -284,13 +427,44 @@ def main() -> None:
         raise ValueError("all durations must be positive")
     if not args.calibration.is_file():
         raise FileNotFoundError(args.calibration)
-    trials = len(args.sequences) * len(set(args.durations_ms))
+    units: list[tuple[str, str, Path, float]] = []
+    if args.clips_root is None:
+        for sequence in args.sequences:
+            units.append(
+                (
+                    sequence,
+                    "full_gt",
+                    args.gt_tracks_root / f"{sequence}.gt.txt",
+                    float("nan"),
+                )
+            )
+    else:
+        for sequence in args.sequences:
+            for difficulty in ("slow", "medium", "fast"):
+                clip_dir = args.clips_root / sequence / difficulty
+                tracks_path = clip_dir / "tracks.gt.txt"
+                metadata_path = clip_dir / "clip.json"
+                if not tracks_path.is_file() or not metadata_path.is_file():
+                    raise FileNotFoundError(
+                        f"missing EDS difficulty clip files under {clip_dir}"
+                    )
+                with metadata_path.open() as handle:
+                    metadata = json.load(handle)
+                units.append(
+                    (
+                        sequence,
+                        difficulty,
+                        tracks_path,
+                        float(metadata["mean_pixel_speed_pxps"]),
+                    )
+                )
+
+    trials = len(units) * len(set(args.durations_ms))
     model, model_config = load_model(args)
     results: list[dict[str, object]] = []
     trial_index = 0
-    for sequence in args.sequences:
+    for sequence, difficulty, tracks_path, clip_speed in units:
         sequence_dir = args.data_root / sequence
-        tracks_path = args.gt_tracks_root / f"{sequence}.gt.txt"
         if not tracks_path.is_file():
             raise FileNotFoundError(tracks_path)
         times, track_ids, gt_tracks = load_tracks(tracks_path)
@@ -304,8 +478,13 @@ def main() -> None:
         for duration_ms in sorted(set(args.durations_ms)):
             trial_index += 1
             label = f"{duration_ms:g}ms".replace(".", "p")
-            prediction_path = args.output_dir / "predictions" / sequence / f"{label}.npz"
-            print(f"[{trial_index}/{trials}] {sequence}, duration={duration_ms:g} ms")
+            prediction_path = (
+                args.output_dir / "predictions" / sequence / difficulty / f"{label}.npz"
+            )
+            print(
+                f"[{trial_index}/{trials}] {sequence}/{difficulty}, "
+                f"duration={duration_ms:g} ms"
+            )
             if not (args.resume and prediction_path.is_file()):
                 if trial_data is None:
                     trial_data = load_required_events(
@@ -314,7 +493,7 @@ def main() -> None:
                         float(times[-1]),
                         max(args.durations_ms),
                     )
-                run_trial(
+                run_trial_arrays(
                     args,
                     model,
                     model_config,
@@ -332,8 +511,10 @@ def main() -> None:
             results.append(
                 {
                     "sequence": sequence,
+                    "difficulty": difficulty,
                     "duration_ms": float(duration_ms),
                     "timestamp_origin_s": timestamp_origin_s,
+                    "clip_mean_pixel_speed_pxps": clip_speed,
                     **metrics,
                     "events_file": str(events_path),
                     "prediction_path": str(prediction_path),

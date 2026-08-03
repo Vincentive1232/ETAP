@@ -175,12 +175,14 @@ class FixedDurationRepresentationBuilder:
         num_stacks: int,
         camera_matrix: np.ndarray,
         distortion: np.ndarray,
+        homography: np.ndarray | None = None,
     ) -> None:
         self.events = events
         self.timestamps = events[:, 0]
         self.duration_s = duration_s
         self.height = height
         self.width = width
+        self.homography = homography
         self.converter = EventRepresentationFactory.create(
             {
                 "representation_name": "event_stack",
@@ -228,6 +230,13 @@ class FixedDurationRepresentationBuilder:
             map_x, map_y = self.maps
             representation = np.stack(
                 [cv2.remap(channel, map_x, map_y, cv2.INTER_CUBIC) for channel in representation]
+            )
+        if self.homography is not None:
+            representation = np.stack(
+                [
+                    cv2.warpPerspective(channel, self.homography, (self.width, self.height))
+                    for channel in representation
+                ]
             )
         return representation, count
 
@@ -277,17 +286,46 @@ def run_trial(
     duration_ms: float,
     prediction_path: Path,
 ) -> None:
-    import torch
-
     events = load_events(clip_dir / "events.txt")
     times, track_ids, gt_tracks = load_tracks(clip_dir / "tracks.gt.txt")
+    camera_matrix, distortion = load_calibration(clip_dir / "calib.txt")
+    run_trial_arrays(
+        args,
+        model,
+        model_config,
+        events,
+        times,
+        track_ids,
+        gt_tracks,
+        camera_matrix,
+        distortion,
+        duration_ms,
+        prediction_path,
+    )
+
+
+def run_trial_arrays(
+    args: argparse.Namespace,
+    model: object,
+    model_config: dict[str, object],
+    events: np.ndarray,
+    times: np.ndarray,
+    track_ids: np.ndarray,
+    gt_tracks: np.ndarray,
+    camera_matrix: np.ndarray,
+    distortion: np.ndarray,
+    duration_ms: float,
+    prediction_path: Path,
+    homography: np.ndarray | None = None,
+) -> None:
+    import torch
+
     window_len = int(model_config.get("window_len", 8))
     step = window_len // 2
     length = usable_length(len(times), window_len)
     if length == 0:
-        raise ValueError(f"{clip_dir}: fewer than {window_len} tracking timestamps")
+        raise ValueError(f"fewer than {window_len} tracking timestamps")
     times, gt_tracks = times[:length], gt_tracks[:length]
-    camera_matrix, distortion = load_calibration(clip_dir / "calib.txt")
     builder = FixedDurationRepresentationBuilder(
         events,
         duration_ms / 1000.0,
@@ -296,6 +334,7 @@ def run_trial(
         args.num_stacks,
         camera_matrix,
         distortion,
+        homography,
     )
 
     device = torch.device(args.device)

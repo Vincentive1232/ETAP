@@ -1,12 +1,15 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Script to download and extract EDS dataset sequences
 # Usage: ./download_eds_data.sh [output_directory]
 
-set -e  # Exit on error
+set -euo pipefail
+
+command -v wget >/dev/null || { echo "Error: wget is required" >&2; exit 1; }
+command -v tar >/dev/null || { echo "Error: tar is required" >&2; exit 1; }
 
 OUTPUT_DIR="$(pwd)/data/eds"
-if [ "$1" != "" ]; then
+if [ "${1:-}" != "" ]; then
     OUTPUT_DIR="$1"
 fi
 
@@ -27,6 +30,11 @@ for seq in "${SEQUENCES[@]}"; do
     echo "Processing sequence: $seq"
     
     mkdir -p "$OUTPUT_DIR/$seq"
+
+    if [ -s "$OUTPUT_DIR/$seq/events.h5" ]; then
+        echo "Already complete, skipping: $OUTPUT_DIR/$seq/events.h5"
+        continue
+    fi
     
     URL="$BASE_URL/$seq/$seq.tgz"
     TGZ_FILE="$OUTPUT_DIR/$seq/$seq.tgz"
@@ -34,8 +42,17 @@ for seq in "${SEQUENCES[@]}"; do
     echo "Downloading from: $URL"
     wget -c "$URL" -O "$TGZ_FILE"
     
+    echo "Checking archive..."
+    tar -tzf "$TGZ_FILE" >/dev/null
+
     echo "Extracting..."
     tar -xzf "$TGZ_FILE" -C "$OUTPUT_DIR/$seq"
+
+    if [ ! -s "$OUTPUT_DIR/$seq/events.h5" ]; then
+        echo "Error: extraction did not create $OUTPUT_DIR/$seq/events.h5" >&2
+        echo "Archive kept for inspection: $TGZ_FILE" >&2
+        exit 1
+    fi
     
     echo "Removing archive..."
     rm "$TGZ_FILE"
@@ -51,6 +68,6 @@ echo "======================================================="
 echo "Summary of downloaded data:"
 for seq in "${SEQUENCES[@]}"; do
     echo "$seq:"
-    ls -la "$OUTPUT_DIR/$seq" | grep -v "^total"
+    find "$OUTPUT_DIR/$seq" -maxdepth 1 -type f -printf "  %f  %s bytes\n" | sort
     echo ""
 done

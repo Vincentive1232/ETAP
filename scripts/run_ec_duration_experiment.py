@@ -55,18 +55,6 @@ RESULT_FIELDS = (
     "num_tracks",
     "prediction_path",
 )
-FRAME_RESULT_FIELDS = (
-    "sequence",
-    "clip_difficulty",
-    "duration_ms",
-    "timestamp",
-    "time_since_clip_start_s",
-    "pixel_speed_pxps",
-    "accuracy_5px",
-    "mean_endpoint_error_px",
-    "num_valid_tracks",
-    "pixel_speed_class",
-)
 
 
 def parse_args() -> argparse.Namespace:
@@ -86,7 +74,7 @@ def parse_args() -> argparse.Namespace:
         "--durations-ms",
         nargs="+",
         type=float,
-        default=[5, 10, 20, 50, 100, 200],
+        default=[5, 10, 20, 50, 100, 200, 220, 240],
     )
     parser.add_argument("--sequences", nargs="+", default=None)
     parser.add_argument("--difficulties", nargs="+", choices=DIFFICULTIES, default=list(DIFFICULTIES))
@@ -119,45 +107,6 @@ def discover_clips(args: argparse.Namespace) -> list[tuple[str, str, Path]]:
     if not clips:
         raise FileNotFoundError(f"no difficulty clips found under {args.clips_root}")
     return clips
-
-
-def validate_clips(clips: list[tuple[str, str, Path]], minimum_timestamps: int = 8) -> None:
-    problems = []
-    required = ("events.txt", "tracks.gt.txt", "calib.txt", "clip.json")
-    for sequence, difficulty, clip_dir in clips:
-        missing = [name for name in required if not (clip_dir / name).is_file()]
-        if missing:
-            problems.append(f"{sequence}/{difficulty}: missing {', '.join(missing)}")
-            continue
-        tracks_path = clip_dir / "tracks.gt.txt"
-        has_track_data = False
-        with tracks_path.open() as handle:
-            for line in handle:
-                stripped = line.strip()
-                if stripped and not stripped.startswith("#"):
-                    has_track_data = True
-                    break
-        if not has_track_data:
-            problems.append(f"{sequence}/{difficulty}: tracks.gt.txt is empty")
-            continue
-        try:
-            times, _, _ = load_tracks(tracks_path)
-            if len(times) < minimum_timestamps:
-                problems.append(
-                    f"{sequence}/{difficulty}: only {len(times)} tracking timestamps "
-                    f"(need at least {minimum_timestamps})"
-                )
-        except ValueError as error:
-            problems.append(f"{sequence}/{difficulty}: {error}")
-    if problems:
-        detail = "\n  - ".join(problems)
-        raise ValueError(
-            "Invalid difficulty clips detected before inference:\n"
-            f"  - {detail}\n"
-            "The bundled DDFT tracks cover only about 3.5 seconds per EC sequence, "
-            "so three non-overlapping 5-second tracking clips are impossible. "
-            "Recreate clips with --clip-duration 1.0 and --overwrite."
-        )
 
 
 def load_events(path: Path) -> np.ndarray:
@@ -324,23 +273,21 @@ def run_trial(
     args: argparse.Namespace,
     model: object,
     model_config: dict[str, object],
-    events: np.ndarray,
-    times: np.ndarray,
-    track_ids: np.ndarray,
-    gt_tracks: np.ndarray,
-    camera_matrix: np.ndarray,
-    distortion: np.ndarray,
+    clip_dir: Path,
     duration_ms: float,
     prediction_path: Path,
 ) -> None:
     import torch
 
+    events = load_events(clip_dir / "events.txt")
+    times, track_ids, gt_tracks = load_tracks(clip_dir / "tracks.gt.txt")
     window_len = int(model_config.get("window_len", 8))
     step = window_len // 2
     length = usable_length(len(times), window_len)
     if length == 0:
-        raise ValueError(f"fewer than {window_len} tracking timestamps")
+        raise ValueError(f"{clip_dir}: fewer than {window_len} tracking timestamps")
     times, gt_tracks = times[:length], gt_tracks[:length]
+    camera_matrix, distortion = load_calibration(clip_dir / "calib.txt")
     builder = FixedDurationRepresentationBuilder(
         events,
         duration_ms / 1000.0,
@@ -451,171 +398,6 @@ def read_results(path: Path) -> list[dict[str, object]]:
         for field in numeric:
             row[field] = float(row[field])
     return rows
-
-
-def build_frame_results(rows: list[dict[str, object]]) -> list[dict[str, object]]:
-    frame_rows: list[dict[str, object]] = []
-    for row in rows:
-        with np.load(str(row["prediction_path"])) as data:
-            pred = data["coords"]
-            gt = data["gt_tracks"]
-            timestamps = data["timestamps"]
-        for index in range(1, len(timestamps)):
-            valid_motion = np.all(np.isfinite(gt[index - 1]), axis=1) & np.all(
-                np.isfinite(gt[index]), axis=1
-            )
-            valid_error = np.all(np.isfinite(gt[index]), axis=1) & np.all(
-                np.isfinite(pred[index]), axis=1
-            )
-            if not np.any(valid_motion) or not np.any(valid_error):
-                continue
-            dt = float(timestamps[index] - timestamps[index - 1])
-            if dt <= 0:
-                continue
-            pixel_speed = np.linalg.norm(
-                gt[index, valid_motion] - gt[index - 1, valid_motion], axis=1
-            ) / dt
-            errors = np.linalg.norm(pred[index, valid_error] - gt[index, valid_error], axis=1)
-            frame_rows.append(
-                {
-                    "sequence": row["sequence"],
-                    "clip_difficulty": row["difficulty"],
-                    "duration_ms": float(row["duration_ms"]),
-                    "timestamp": float(timestamps[index]),
-                    "time_since_clip_start_s": float(timestamps[index] - timestamps[0]),
-                    "pixel_speed_pxps": float(np.median(pixel_speed)),
-                    "accuracy_5px": float(np.mean(errors <= 5)),
-                    "mean_endpoint_error_px": float(np.mean(errors)),
-                    "num_valid_tracks": int(len(errors)),
-                    "pixel_speed_class": "",
-                }
-            )
-
-    speeds = np.asarray([float(row["pixel_speed_pxps"]) for row in frame_rows])
-    low_cut, high_cut = np.quantile(speeds, [1.0 / 3.0, 2.0 / 3.0])
-    for row in frame_rows:
-        speed = float(row["pixel_speed_pxps"])
-        row["pixel_speed_class"] = (
-            "slow" if speed <= low_cut else "medium" if speed <= high_cut else "fast"
-        )
-    return frame_rows
-
-
-def write_frame_results(path: Path, rows: list[dict[str, object]]) -> None:
-    with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FRAME_RESULT_FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def plot_pixel_speed_results(rows: list[dict[str, object]], output_dir: Path) -> None:
-    durations = sorted({float(row["duration_ms"]) for row in rows})
-    colors = {"slow": "tab:blue", "medium": "tab:orange", "fast": "tab:red"}
-    fig, axis = plt.subplots(figsize=(8, 5))
-    for speed_class in DIFFICULTIES:
-        if not any(row["pixel_speed_class"] == speed_class for row in rows):
-            continue
-        means, standard_errors = [], []
-        for duration in durations:
-            values = np.asarray(
-                [
-                    float(row["accuracy_5px"])
-                    for row in rows
-                    if row["pixel_speed_class"] == speed_class
-                    and float(row["duration_ms"]) == duration
-                ]
-            )
-            means.append(float(np.mean(values)) if len(values) else np.nan)
-            standard_errors.append(
-                float(np.std(values) / np.sqrt(len(values))) if len(values) else np.nan
-            )
-        axis.errorbar(
-            durations,
-            means,
-            yerr=standard_errors,
-            marker="o",
-            capsize=3,
-            color=colors[speed_class],
-            label=f"{speed_class} pixel speed",
-        )
-    axis.set_xscale("log")
-    axis.set_xlabel("Event-window duration [ms]")
-    axis.set_ylabel("Per-frame tracking accuracy @ 5 px")
-    axis.grid(alpha=0.25)
-    axis.legend()
-    fig.tight_layout()
-    fig.savefig(output_dir / "accuracy_vs_duration_by_pixel_speed.png", dpi=180)
-    plt.close(fig)
-
-    speeds = np.asarray([float(row["pixel_speed_pxps"]) for row in rows])
-    # Quantile bins keep approximately equal sample counts despite skewed speeds.
-    edges = np.unique(np.quantile(speeds, np.linspace(0, 1, 9)))
-    if len(edges) < 2:
-        edges = np.array([speeds[0] - 0.5, speeds[0] + 0.5])
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    matrix = np.full((len(centers), len(durations)), np.nan)
-    for i, (left, right) in enumerate(zip(edges[:-1], edges[1:])):
-        for j, duration in enumerate(durations):
-            values = [
-                float(row["accuracy_5px"])
-                for row in rows
-                if left <= float(row["pixel_speed_pxps"]) <= right
-                and float(row["duration_ms"]) == duration
-            ]
-            if values:
-                matrix[i, j] = float(np.mean(values))
-
-    fig, axis = plt.subplots(figsize=(9, 6))
-    image = axis.imshow(matrix, origin="lower", aspect="auto", vmin=0, vmax=1, cmap="magma")
-    axis.set_xticks(range(len(durations)), [f"{duration:g}" for duration in durations])
-    axis.set_yticks(range(len(centers)), [f"{center:.0f}" for center in centers])
-    axis.set_xlabel("Event-window duration [ms]")
-    axis.set_ylabel("Median GT pixel speed bin [px/s]")
-    fig.colorbar(image, ax=axis, label="Accuracy @ 5 px")
-    fig.tight_layout()
-    fig.savefig(output_dir / "accuracy_duration_pixel_speed_heatmap.png", dpi=180)
-    plt.close(fig)
-
-    best_indices = np.nanargmax(matrix, axis=1)
-    best_durations = np.asarray(durations)[best_indices]
-    can_correlate = len(centers) > 1 and np.std(best_durations) > 0
-    correlation = (
-        float(np.corrcoef(centers, best_durations)[0, 1]) if can_correlate else math.nan
-    )
-    if len(centers) > 1:
-        slope, intercept = np.polyfit(centers, best_durations, 1)
-    else:
-        slope, intercept = math.nan, float(best_durations[0])
-    fig, axis = plt.subplots(figsize=(8, 5))
-    axis.scatter(centers, best_durations, color="tab:purple", label="speed bins")
-    if len(centers) > 1:
-        x_line = np.linspace(centers.min(), centers.max(), 100)
-        axis.plot(x_line, intercept + slope * x_line, "k--", label=f"slope={slope:.3f} ms/(px/s)")
-    axis.set_xlabel("Median GT pixel speed [px/s]")
-    axis.set_ylabel("Best duration [ms]")
-    axis.grid(alpha=0.25)
-    axis.legend()
-    fig.tight_layout()
-    fig.savefig(output_dir / "optimal_duration_vs_pixel_speed.png", dpi=180)
-    plt.close(fig)
-
-    with (output_dir / "pixel_speed_relationship.json").open("w") as handle:
-        json.dump(
-            {
-                "speed_tertile_boundaries_pxps": [
-                    float(np.quantile(speeds, 1.0 / 3.0)),
-                    float(np.quantile(speeds, 2.0 / 3.0)),
-                ],
-                "optimal_duration_pixel_speed_pearson_r": correlation,
-                "optimal_duration_slope_ms_per_pxps": float(slope),
-                "interpretation": (
-                    "Negative correlation/slope supports shorter optimal durations at "
-                    "higher image-plane motion speed."
-                ),
-            },
-            handle,
-            indent=2,
-        )
 
 
 def aggregate(rows: list[dict[str, object]], field: str, duration: float, difficulty: str) -> np.ndarray:
@@ -771,23 +553,18 @@ def main() -> None:
             raise FileNotFoundError(results_path)
         rows = read_results(results_path)
         plot_results(rows, args.output_dir)
-        frame_rows = build_frame_results(rows)
-        write_frame_results(args.output_dir / "frame_results.csv", frame_rows)
-        plot_pixel_speed_results(frame_rows, args.output_dir)
         print(f"Regenerated plots in {args.output_dir}")
         return
 
     if any(duration <= 0 for duration in args.durations_ms):
         raise ValueError("all durations must be positive")
     clips = discover_clips(args)
-    validate_clips(clips)
     model, model_config = load_model(args)
     rows: list[dict[str, object]] = []
     total_trials = len(clips) * len(args.durations_ms)
     trial_index = 0
     for sequence, difficulty, clip_dir in clips:
         motion = load_clip_motion(clip_dir)
-        trial_data = None
         for duration_ms in sorted(set(args.durations_ms)):
             trial_index += 1
             duration_label = f"{duration_ms:g}ms".replace(".", "p")
@@ -797,27 +574,7 @@ def main() -> None:
                 f"duration={duration_ms:g} ms"
             )
             if not (args.resume and prediction_path.is_file()):
-                if trial_data is None:
-                    print(f"  Loading {clip_dir / 'events.txt'} once for all durations...")
-                    trial_data = (
-                        load_events(clip_dir / "events.txt"),
-                        *load_tracks(clip_dir / "tracks.gt.txt"),
-                        *load_calibration(clip_dir / "calib.txt"),
-                    )
-                events, times, track_ids, gt_tracks, camera_matrix, distortion = trial_data
-                run_trial(
-                    args,
-                    model,
-                    model_config,
-                    events,
-                    times,
-                    track_ids,
-                    gt_tracks,
-                    camera_matrix,
-                    distortion,
-                    duration_ms,
-                    prediction_path,
-                )
+                run_trial(args, model, model_config, clip_dir, duration_ms, prediction_path)
             metrics = evaluate_prediction(prediction_path)
             row: dict[str, object] = {
                 "sequence": sequence,
@@ -832,9 +589,6 @@ def main() -> None:
             write_results(results_path, rows)
 
     plot_results(rows, args.output_dir)
-    frame_rows = build_frame_results(rows)
-    write_frame_results(args.output_dir / "frame_results.csv", frame_rows)
-    plot_pixel_speed_results(frame_rows, args.output_dir)
     print(f"Results: {results_path}")
     print(f"Plots:   {args.output_dir}")
 

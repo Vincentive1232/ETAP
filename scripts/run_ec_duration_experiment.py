@@ -109,6 +109,45 @@ def discover_clips(args: argparse.Namespace) -> list[tuple[str, str, Path]]:
     return clips
 
 
+def validate_clips(clips: list[tuple[str, str, Path]], minimum_timestamps: int = 8) -> None:
+    problems = []
+    required = ("events.txt", "tracks.gt.txt", "calib.txt", "clip.json")
+    for sequence, difficulty, clip_dir in clips:
+        missing = [name for name in required if not (clip_dir / name).is_file()]
+        if missing:
+            problems.append(f"{sequence}/{difficulty}: missing {', '.join(missing)}")
+            continue
+        tracks_path = clip_dir / "tracks.gt.txt"
+        has_track_data = False
+        with tracks_path.open() as handle:
+            for line in handle:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    has_track_data = True
+                    break
+        if not has_track_data:
+            problems.append(f"{sequence}/{difficulty}: tracks.gt.txt is empty")
+            continue
+        try:
+            times, _, _ = load_tracks(tracks_path)
+            if len(times) < minimum_timestamps:
+                problems.append(
+                    f"{sequence}/{difficulty}: only {len(times)} tracking timestamps "
+                    f"(need at least {minimum_timestamps})"
+                )
+        except ValueError as error:
+            problems.append(f"{sequence}/{difficulty}: {error}")
+    if problems:
+        detail = "\n  - ".join(problems)
+        raise ValueError(
+            "Invalid difficulty clips detected before inference:\n"
+            f"  - {detail}\n"
+            "The bundled DDFT tracks cover only about 3.5 seconds per EC sequence, "
+            "so three non-overlapping 5-second tracking clips are impossible. "
+            "Recreate clips with --clip-duration 1.0 and --overwrite."
+        )
+
+
 def load_events(path: Path) -> np.ndarray:
     events = np.loadtxt(path, comments="#", dtype=np.float64, ndmin=2)
     if events.shape[1] < 4:
@@ -561,6 +600,7 @@ def main() -> None:
     if any(duration <= 0 for duration in args.durations_ms):
         raise ValueError("all durations must be positive")
     clips = discover_clips(args)
+    validate_clips(clips)
     model, model_config = load_model(args)
     rows: list[dict[str, object]] = []
     total_trials = len(clips) * len(args.durations_ms)

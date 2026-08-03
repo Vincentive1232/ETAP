@@ -138,6 +138,19 @@ def parse_timestamp(line: str, column: int) -> float | None:
         raise ValueError(f"cannot parse timestamp column {column} from: {stripped[:120]}") from error
 
 
+def timestamp_bounds(path: Path, column: int) -> tuple[float, float]:
+    minimum, maximum = np.inf, -np.inf
+    with path.open("r") as handle:
+        for line in handle:
+            timestamp = parse_timestamp(line, column)
+            if timestamp is not None:
+                minimum = min(minimum, timestamp)
+                maximum = max(maximum, timestamp)
+    if not np.isfinite(minimum):
+        raise ValueError(f"{path}: no timestamped data")
+    return float(minimum), float(maximum)
+
+
 def open_outputs(
     intervals: list[dict[str, object]], filename: str
 ) -> list[tuple[dict[str, object], TextIO]]:
@@ -274,6 +287,16 @@ def materialize_sequence(
     track_counts = slice_timestamp_file(tracks_path, intervals, "tracks.gt.txt", timestamp_column=1)
     for difficulty, count in track_counts.items():
         counts.setdefault(difficulty, {})["tracks.gt.txt"] = count
+    if tracks_path.is_file():
+        empty = [
+            str(interval["difficulty"])
+            for interval in intervals
+            if track_counts.get(str(interval["difficulty"]), 0) == 0
+        ]
+        if empty:
+            raise RuntimeError(
+                f"{sequence_dir.name}: no DDFT tracks in clips: {', '.join(empty)}"
+            )
 
     for interval in intervals:
         difficulty = str(interval["difficulty"])
@@ -336,6 +359,20 @@ def main() -> None:
             args.translation_scale,
             args.rotation_scale,
         )
+        tracks_path = args.gt_tracks_root / f"{sequence}.gt.txt"
+        if tracks_path.is_file():
+            tracks_start, tracks_end = timestamp_bounds(tracks_path, 1)
+            valid = (motion["timestamp"] >= tracks_start) & (motion["timestamp"] <= tracks_end)
+            motion = {key: values[valid] for key, values in motion.items()}
+            if len(motion["timestamp"]) < 3:
+                raise ValueError(
+                    f"{sequence}: camera ground truth does not overlap {tracks_path}"
+                )
+            available = float(motion["timestamp"][-1] - motion["timestamp"][0])
+            print(
+                f"{sequence}: restricting selection to DDFT tracking GT "
+                f"({available:.3f}s available)"
+            )
         intervals = select_intervals(
             sequence, motion, args.clip_duration, args.selection_stride
         )
